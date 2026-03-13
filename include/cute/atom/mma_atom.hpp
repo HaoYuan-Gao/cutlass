@@ -218,6 +218,12 @@ struct TiledMMA : MMA_Atom
   using AtomLayoutB_TV = typename MMA_Atom::LayoutB_TV;
 
   static_assert(   rank_v<AtomLayoutMNK>  == 3,   "TiledMMA requires rank-3 AtomLayoutMNK");
+
+  // 默认 PermutationMNK 根据一个 MMA Atom 本身覆盖的 AtomShape_MNK，乘以 AtomLayoutMNK 在 M/N/K 上复制 Atom 的数量，
+  // 推导出整个 TiledMMA 的自然 MNK Tile 大小。公式就是：
+  //    Tile_M = AtomM * NumAtom_M 
+  //    Tile_N = AtomN * NumAtom_N 
+  //    Tile_K = AtomK * NumAtom_K 
   static_assert(   rank_v<PermutationMNK> == 3,   "TiledMMA requires rank-3 PermutationMNK");
   static_assert( is_tuple<PermutationMNK>::value, "TiledMMA requires independent permutations of MNK.");
   static_assert(is_static<PermutationMNK>::value, "TiledMMA requires static permutations of MNK.");
