@@ -51,6 +51,147 @@ namespace cute
  * the result is
  * 0bxxxxxxxxxxxxxxxxYYxxxxxxxxxAAxxx where AA = ZZ xor YY
  */
+
+// 通用 XOR Swizzle 地址变换:
+//
+// Swizzle 的作用是在不改变 Tensor 逻辑坐标的情况下，
+// 对 shared memory 的物理地址进行 bit 级重新编码。
+//
+// 核心变换:
+//
+//                  ZZZ_new = ZZZ_old xor YYY
+//
+// 其中:
+//   - YYY: 用于参与 XOR 的地址 bit
+//   - ZZZ: 被修改的地址 bit
+//
+// 地址 bit 示意:
+//
+//
+//   高位地址                                 低位地址
+//   |                                         |
+//   v                                         v
+//
+//   xxxxxxxxx | YYY | xxxxx | ZZZ | xxx
+//                  \             /
+//                   \           /
+//                    \         /
+//                     XOR
+//                      |
+//                      v
+//
+//   xxxxxxxxx | YYY | xxxxx | ZZZ_new | xxx
+//
+//
+// 经过 Swizzle 后:
+//
+//   - Tensor 的逻辑位置不变
+//   - 元素之间的映射关系不变
+//   - 但是 shared memory 中实际访问的地址发生变化
+//
+// 主要目的:
+//   通过重新分布地址 bit，改变 shared memory bank 映射，
+//   从而减少或消除 bank conflict。
+//
+//
+// 参数说明:
+//
+// ---------------------------------------------------------------------
+// BBits:
+//
+//   表示参与 XOR 运算的 bit 数量。
+//   它决定 YYY 和 ZZZ 两个 bit 区域的宽度。
+//
+//   例如:
+//
+//       BBits = 3
+//
+//   表示:
+//
+//       YYY = 3 bits
+//       ZZZ = 3 bits
+//
+//   XOR 变换:
+//
+//       ZZZ_new[2:0] = ZZZ_old[2:0] xor YYY[2:0]
+//
+//   BBits 越大，参与地址重排的 bit 越多，
+//   可以影响更多 shared memory bank 映射。
+//
+//
+// ---------------------------------------------------------------------
+// MBase:
+//
+//   表示最低多少位地址 bit 保持不变。
+//   这些 bit 不参与 Swizzle，不会被 XOR 修改。
+//
+//   这些低位通常表示:
+//
+//       1. 元素内部 byte offset
+//          例如:
+//             half 需要保护 bit0
+//             float 需要保护 bit0~bit1
+//
+//       2. 数据访问对齐要求
+//          例如:
+//             vector load/store
+//             ldmatrix
+//             MMA tensor core 指令
+//
+//   作用:
+//
+//       保证 Swizzle 后的地址仍然指向正确的元素，
+//       不会因为修改低位地址而访问到元素中间位置。
+//
+//
+//   例如:
+//
+//       MBase = 4
+//
+//   表示:
+//
+//       address:
+//
+//       xxxx xxxx xxxx xxxx
+//                      ^^^^
+//                         |
+//                         最低 4 bit 固定
+//
+//   Swizzle 只能修改 bit4 以上的地址。
+//
+//   因此可以保持:
+//
+//       16-byte 对齐
+//
+//
+// ---------------------------------------------------------------------
+// SShift:
+//
+//   表示 YYY 和 ZZZ 两组 bit 之间的距离。
+//   决定哪一组 bit 作为 XOR 输入，以及 XOR 到哪一组 bit。
+//
+//   正数 SShift:
+//
+//       YYY 位于 ZZZ 的高位方向
+//
+//       例如:
+//
+//             YYY
+//              |
+//              | SShift
+//              v
+//             ZZZ
+//
+//       变换:
+//
+//             ZZZ_new = ZZZ xor YYY
+//
+//
+//   负数 SShift:
+//
+//       YYY 位于 ZZZ 的低位方向
+//
+//       表示从低位地址 bit 获取 XOR 信息。
 template <int BBits, int MBase, int SShift = BBits>
 struct Swizzle
 {
@@ -75,6 +216,9 @@ struct Swizzle
   auto
   apply(Offset const& offset)
   {
+    // 1. offset & yyy_msk{} : 提取 yyy 对应的 bit 区域
+    // 2. shiftr(offset & yyy_msk{}, msk_sft{}) : 右移 yyy 区域到 zzz 区域
+    // 3. offset ^ shiftr(offset & yyy_msk{}, msk_sft{}) : 对 zzz 区域进行 XOR 变换
     return offset ^ shiftr(offset & yyy_msk{}, msk_sft{});   // ZZZ ^= YYY
   }
 
@@ -98,8 +242,8 @@ struct Swizzle
 //
 // make_swizzle<0b1000, 0b0100>()         ->  Swizzle<1,2,1>
 // make_swizzle<0b11000000, 0b00000110>() ->  Swizzle<2,1,5>
-//
-
+// 根据 yyy_msk{} 和 zzz_msk{} 计算 BBits, MBase, SShift
+// 
 template <uint32_t Y, uint32_t Z>
 CUTE_HOST_DEVICE constexpr
 auto
@@ -145,6 +289,24 @@ composition(Swizzle<B0,M0,S0>, Swizzle<B1,M1,S1>)
 // MixedBits can only be manipulated through bitwise operations
 
 // Abstract value:  StaticInt | (dynamic_int_ & StaticFlags)
+
+/**
+MixedBits
+
+  32-bit value
+  |
+  +-------- or --------+
+  |                |
+StaticInt        dynamic_int_
+(compile time)   (runtime)
+
+
+StaticFlags:
+0 -> static bit
+1 -> dynamic bit
+
+cutlass 属于模板编程，所以 StaticInt 和 StaticFlags 都是编译时常量。
+*/
 template <uint32_t StaticInt,
           uint32_t StaticFlags>    // 0: static, 1: dynamic
 struct MixedBits
@@ -161,6 +323,21 @@ struct MixedBits
 
 // Return a value representing (C<s>{} | (d & C<f>)) potentially using MixedBits to track s and f.
 // This maker does allow ((s & f) != 0) and enforces the MixedBits invariant before creation.
+
+/**
+s：静态 bit
+f：动态 bit mask
+d：动态值
+          make_mixed_bits
+                |
+                |
+      ---------------------
+      |                   |
+  全静态               有运行时bit
+
+return C<x>       return MixedBits<s,f>
+
+*/
 template <auto s, class DynamicType, auto f>
 CUTE_HOST_DEVICE constexpr
 auto
@@ -436,10 +613,18 @@ to_mixed_bits(Shape const& shape, Stride const& stride, Coord const& coord)
   if constexpr (is_tuple<Shape>::value && is_tuple<Stride>::value && is_tuple<Coord>::value) {
     static_assert(tuple_size<Shape>::value == tuple_size<Stride>::value, "Mismatched ranks");
     static_assert(tuple_size<Shape>::value == tuple_size<Coord >::value, "Mismatched ranks");
+    // 对于 Pow2Layout，每个维度的 offset 占据不同的 bits
+    // 例如 (8, 16):(16, 1) ----- dimension0: xxxx000000, dimension1: 0000xxxx
+    // 所以 xor 操作就是合并 bit pattern, 即 offset = (c0​∗s0​) ^ (c1​∗s1​)..., 等价于 offset = (c0​∗s0​) + (c1​∗s1​)...,
     return transform_apply(shape, stride, coord, [](auto const& s, auto const& d, auto const& c) { return to_mixed_bits(s,d,c); },
                                                  [](auto const&... a) { return (a ^ ...); });
   } else if constexpr (is_integral<Shape>::value && is_integral<Stride>::value && is_integral<Coord>::value) {
     static_assert(decltype(shape*stride)::value == 0 || has_single_bit(decltype(shape*stride)::value), "Requires pow2 shape*stride.");
+    /*
+     * static bits = 0
+     * dynamic value = coord * stride
+     * dynamic mask = (shape - 1) * stride, 其中，shape - 1 的意思是：0 <= coord < shape
+     */
     return make_mixed_bits(Int<0>{}, coord * stride, (shape - Int<1>{}) * stride);
   } else {
     static_assert(is_integral<Shape>::value && is_integral<Stride>::value && is_integral<Coord>::value, "Either Shape, Stride, and Coord must be all tuples, or they must be all integral (in the sense of cute::is_integral).");

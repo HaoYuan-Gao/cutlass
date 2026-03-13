@@ -54,6 +54,7 @@
 */
 
 // Standard Library includes
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -67,6 +68,39 @@
 
 // Defines cutlass::gemm::device::Gemm, the generic Gemm computation template class.
 #include "cutlass/gemm/device/gemm.h"
+
+enum class MatrixLayout {
+  kColumnMajor,
+  kRowMajor
+};
+
+char const *to_string(MatrixLayout layout) {
+  switch (layout) {
+    case MatrixLayout::kColumnMajor:
+      return "ColumnMajor";
+    case MatrixLayout::kRowMajor:
+      return "RowMajor";
+    default:
+      return "Unknown";
+  }
+}
+
+__host__ __device__ int matrix_offset(
+  int row,
+  int column,
+  int rows,
+  int columns,
+  MatrixLayout layout) {
+  return (layout == MatrixLayout::kColumnMajor) ? row + column * rows
+                                                : row * columns + column;
+}
+
+cudaError_t InitializeMatrix(
+  float *matrix,
+  int rows,
+  int columns,
+  MatrixLayout layout,
+  int seed = 0);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -144,6 +178,46 @@ cudaError_t CutlassSgemmNN(
   return cudaSuccess;
 }
 
+cudaError_t CutlassSgemmNN_RowMajor(
+  int M,
+  int N,
+  int K,
+  float alpha,
+  float const *A,
+  int lda,
+  float const *B,
+  int ldb,
+  float beta,
+  float *C,
+  int ldc) {
+
+  using RowMajor = cutlass::layout::RowMajor;
+
+  using CutlassGemm = cutlass::gemm::device::Gemm<float,     // Data-type of A matrix
+                                                  RowMajor,  // Layout of A matrix
+                                                  float,     // Data-type of B matrix
+                                                  RowMajor,  // Layout of B matrix
+                                                  float,     // Data-type of C matrix
+                                                  RowMajor>; // Layout of C matrix
+
+  CutlassGemm gemm_operator;
+
+  CutlassGemm::Arguments args({M, N, K},
+                              {A, lda},
+                              {B, ldb},
+                              {C, ldc},
+                              {C, ldc},
+                              {alpha, beta});
+
+  cutlass::Status status = gemm_operator(args);
+
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+
+  return cudaSuccess;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // The source code after this point in the file is generic CUDA using the CUDA Runtime API
@@ -156,13 +230,14 @@ __global__ void InitializeMatrix_kernel(
   float *matrix,
   int rows,
   int columns,
+  MatrixLayout layout,
   int seed = 0) {
 
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
   if (i < rows && j < columns) {
-    int offset = i + j * rows;
+    int offset = matrix_offset(i, j, rows, columns, layout);
 
     // Generate arbitrary elements.
     int const k = 16807;
@@ -175,6 +250,16 @@ __global__ void InitializeMatrix_kernel(
 
 /// Simple function to initialize a matrix to arbitrary small integers.
 cudaError_t InitializeMatrix(float *matrix, int rows, int columns, int seed = 0) {
+  return InitializeMatrix(matrix, rows, columns, MatrixLayout::kColumnMajor, seed);
+}
+
+/// Simple function to initialize a matrix to arbitrary small integers.
+cudaError_t InitializeMatrix(
+  float *matrix,
+  int rows,
+  int columns,
+  MatrixLayout layout,
+  int seed) {
 
   dim3 block(16, 16);
   dim3 grid(
@@ -182,7 +267,7 @@ cudaError_t InitializeMatrix(float *matrix, int rows, int columns, int seed = 0)
     (columns + block.y - 1) / block.y
   );
 
-  InitializeMatrix_kernel<<< grid, block >>>(matrix, rows, columns, seed);
+  InitializeMatrix_kernel<<< grid, block >>>(matrix, rows, columns, layout, seed);
 
   return cudaGetLastError();
 }
@@ -190,7 +275,12 @@ cudaError_t InitializeMatrix(float *matrix, int rows, int columns, int seed = 0)
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Allocates device memory for a matrix then fills with arbitrary small integers.
-cudaError_t AllocateMatrix(float **matrix, int rows, int columns, int seed = 0) {
+cudaError_t AllocateMatrix(
+  float **matrix,
+  int rows,
+  int columns,
+  MatrixLayout layout = MatrixLayout::kColumnMajor,
+  int seed = 0) {
   cudaError_t result;
 
   size_t sizeof_matrix = sizeof(float) * rows * columns;
@@ -214,7 +304,7 @@ cudaError_t AllocateMatrix(float **matrix, int rows, int columns, int seed = 0) 
   }
 
   // Initialize matrix elements to arbitrary small integers.
-  result = InitializeMatrix(*matrix, rows, columns, seed);
+  result = InitializeMatrix(*matrix, rows, columns, layout, seed);
 
   if (result != cudaSuccess) {
     std::cerr << "Failed to initialize matrix: "
@@ -235,11 +325,14 @@ __global__ void ReferenceGemm_kernel(
   float alpha,
   float const *A,
   int lda,
+  MatrixLayout layout_a,
   float const *B,
   int ldb,
+  MatrixLayout layout_b,
   float beta,
   float *C,
-  int ldc) {
+  int ldc,
+  MatrixLayout layout_c) {
 
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -248,10 +341,13 @@ __global__ void ReferenceGemm_kernel(
     float accumulator = 0;
 
     for (int k = 0; k < K; ++k) {
-      accumulator += A[i + k * lda] * B[k + j * ldb];
+      int offset_a = (layout_a == MatrixLayout::kColumnMajor) ? i + k * lda : i * lda + k;
+      int offset_b = (layout_b == MatrixLayout::kColumnMajor) ? k + j * ldb : k * ldb + j;
+      accumulator += A[offset_a] * B[offset_b];
     }
 
-    C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
+    int offset_c = (layout_c == MatrixLayout::kColumnMajor) ? i + j * ldc : i * ldc + j;
+    C[offset_c] = alpha * accumulator + beta * C[offset_c];
   }
 }
 
@@ -263,11 +359,14 @@ cudaError_t ReferenceGemm(
   float alpha,
   float const *A,
   int lda,
+  MatrixLayout layout_a,
   float const *B,
   int ldb,
+  MatrixLayout layout_b,
   float beta,
   float *C,
-  int ldc) {
+  int ldc,
+  MatrixLayout layout_c) {
 
   dim3 block(16, 16);
   dim3 grid(
@@ -275,29 +374,121 @@ cudaError_t ReferenceGemm(
     (N + block.y - 1) / block.y
   );
 
-  ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+  ReferenceGemm_kernel<<< grid, block >>>(
+    M, N, K, alpha, A, lda, layout_a, B, ldb, layout_b, beta, C, ldc, layout_c);
 
   return cudaGetLastError();
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Allocate several matrices in GPU device memory and call a single-precision
-/// CUTLASS GEMM kernel.
-cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
+struct PerformanceResult {
+  float average_runtime_ms = 0;
+  float gflops = 0;
+};
+
+cudaError_t BenchmarkGemm(
+  char const *name,
+  cudaError_t (*gemm_fn)(int, int, int, float, float const *, int, float const *, int, float, float *, int),
+  int M,
+  int N,
+  int K,
+  float alpha,
+  float const *A,
+  int lda,
+  float const *B,
+  int ldb,
+  float beta,
+  float *C,
+  int ldc,
+  int warmups,
+  int iterations,
+  PerformanceResult &performance) {
+
+  cudaError_t result = cudaSuccess;
+
+  for (int iter = 0; iter < warmups; ++iter) {
+    result = gemm_fn(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    if (result != cudaSuccess) {
+      return result;
+    }
+  }
+
+  result = cudaDeviceSynchronize();
+  if (result != cudaSuccess) {
+    return result;
+  }
+
+  cudaEvent_t start;
+  cudaEvent_t stop;
+
+  result = cudaEventCreate(&start);
+  if (result != cudaSuccess) {
+    return result;
+  }
+
+  result = cudaEventCreate(&stop);
+  if (result != cudaSuccess) {
+    cudaEventDestroy(start);
+    return result;
+  }
+
+  result = cudaEventRecord(start);
+  if (result == cudaSuccess) {
+    for (int iter = 0; iter < iterations; ++iter) {
+      result = gemm_fn(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+      if (result != cudaSuccess) {
+        break;
+      }
+    }
+  }
+
+  if (result == cudaSuccess) {
+    result = cudaEventRecord(stop);
+  }
+  if (result == cudaSuccess) {
+    result = cudaEventSynchronize(stop);
+  }
+
+  if (result == cudaSuccess) {
+    float elapsed_ms = 0;
+    result = cudaEventElapsedTime(&elapsed_ms, start, stop);
+    if (result == cudaSuccess) {
+      performance.average_runtime_ms = elapsed_ms / static_cast<float>(iterations);
+      double flops = 2.0 * double(M) * double(N) * double(K);
+      performance.gflops =
+        static_cast<float>(flops / (performance.average_runtime_ms * 1.0e6));
+      std::cout << name << " average runtime: " << std::fixed << std::setprecision(3)
+                << performance.average_runtime_ms << " ms, throughput: "
+                << std::setprecision(2) << performance.gflops << " GFLOP/s" << std::endl;
+    }
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+cudaError_t TestCutlassGemm(
+  int M,
+  int N,
+  int K,
+  float alpha,
+  float beta,
+  MatrixLayout layout,
+  int warmups,
+  int iterations) {
   cudaError_t result;
 
-  //
-  // Define several matrices to be used as operands to GEMM kernels.
-  //
-
-  // Compute leading dimensions for each matrix.
-  int lda = M;
-  int ldb = K;
-  int ldc = M;
+  int lda = (layout == MatrixLayout::kColumnMajor) ? M : K;
+  int ldb = (layout == MatrixLayout::kColumnMajor) ? K : N;
+  int ldc = (layout == MatrixLayout::kColumnMajor) ? M : N;
 
   // Compute size in bytes of the C matrix.
-  size_t sizeof_C = sizeof(float) * ldc * N;
+  size_t sizeof_C = sizeof(float) * M * N;
 
   // Define pointers to matrices in GPU device memory.
   float *A;
@@ -309,20 +500,20 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   // Allocate matrices in GPU device memory with arbitrary seeds.
   //
 
-  result = AllocateMatrix(&A, M, K, 0);
+  result = AllocateMatrix(&A, M, K, layout, 0);
 
   if (result !=  cudaSuccess) {
     return result;
   }
 
-  result = AllocateMatrix(&B, K, N, 17);
+  result = AllocateMatrix(&B, K, N, layout, 17);
 
   if (result !=  cudaSuccess) {
     cudaFree(A);
     return result;
   }
 
-  result = AllocateMatrix(&C_cutlass, M, N, 101);
+  result = AllocateMatrix(&C_cutlass, M, N, layout, 101);
 
   if (result != cudaSuccess) {
     cudaFree(A);
@@ -330,7 +521,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
     return result;
   }
 
-  result = AllocateMatrix(&C_reference, M, N, 101);
+  result = AllocateMatrix(&C_reference, M, N, layout, 101);
 
   if (result != cudaSuccess) {
     cudaFree(A);
@@ -357,10 +548,29 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   // Launch CUTLASS GEMM.
   //
 
-  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc);
+  auto gemm_fn = (layout == MatrixLayout::kColumnMajor) ? &CutlassSgemmNN
+                                                        : &CutlassSgemmNN_RowMajor;
+
+  PerformanceResult performance;
+  result = BenchmarkGemm(to_string(layout),
+                         gemm_fn,
+                         M,
+                         N,
+                         K,
+                         alpha,
+                         A,
+                         lda,
+                         B,
+                         ldb,
+                         beta,
+                         C_cutlass,
+                         ldc,
+                         warmups,
+                         iterations,
+                         performance);
 
   if (result != cudaSuccess) {
-    std::cerr << "CUTLASS GEMM kernel failed: "
+    std::cerr << to_string(layout) << " CUTLASS GEMM kernel failed: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);
@@ -376,10 +586,10 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   //
 
   // Launch reference GEMM
-  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
+  result = ReferenceGemm(M, N, K, alpha, A, lda, layout, B, ldb, layout, beta, C_reference, ldc, layout);
 
   if (result != cudaSuccess) {
-    std::cerr << "Reference GEMM kernel failed: "
+    std::cerr << to_string(layout) << " reference GEMM kernel failed: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);
@@ -391,13 +601,13 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   }
 
   // Copy to host and verify equivalence.
-  std::vector<float> host_cutlass(ldc * N, 0);
-  std::vector<float> host_reference(ldc * N, 0);
+  std::vector<float> host_cutlass(M * N, 0);
+  std::vector<float> host_reference(M * N, 0);
 
   result = cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
 
   if (result != cudaSuccess) {
-    std::cerr << "Failed to copy CUTLASS GEMM results: "
+    std::cerr << "Failed to copy " << to_string(layout) << " CUTLASS GEMM results: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);
@@ -411,7 +621,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   result = cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
 
   if (result != cudaSuccess) {
-    std::cerr << "Failed to copy Reference GEMM results: "
+    std::cerr << "Failed to copy " << to_string(layout) << " reference GEMM results: "
       << cudaGetErrorString(result) << std::endl;
 
     cudaFree(C_reference);
@@ -436,10 +646,12 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   //
 
   if (host_cutlass != host_reference) {
-    std::cerr << "CUTLASS results incorrect." << std::endl;
+    std::cerr << to_string(layout) << " CUTLASS results incorrect." << std::endl;
 
     return cudaErrorUnknown;
   }
+
+  std::cout << to_string(layout) << " verification passed." << std::endl;
 
   return cudaSuccess;
 }
@@ -450,7 +662,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
 //
 // usage:
 //
-//   00_basic_gemm <M> <N> <K> <alpha> <beta>
+//   00_basic_gemm <M> <N> <K> <alpha> <beta> <warmups> <iterations>
 //
 int main(int argc, const char *arg[]) {
 
@@ -474,17 +686,51 @@ int main(int argc, const char *arg[]) {
     ss >> scalars[i - 4];
   }
 
+  int warmups = 10;
+  int iterations = 50;
+
+  if (argc > 6) {
+    std::stringstream ss(arg[6]);
+    ss >> warmups;
+  }
+
+  if (argc > 7) {
+    std::stringstream ss(arg[7]);
+    ss >> iterations;
+  }
+
   //
   // Run the CUTLASS GEMM test.
   //
+
+  std::cout << "Problem size: M=" << problem[0] << ", N=" << problem[1]
+            << ", K=" << problem[2] << ", alpha=" << scalars[0]
+            << ", beta=" << scalars[1] << ", warmups=" << warmups
+            << ", iterations=" << iterations << std::endl;
 
   cudaError_t result = TestCutlassGemm(
     problem[0],     // GEMM M dimension
     problem[1],     // GEMM N dimension
     problem[2],     // GEMM K dimension
     scalars[0],     // alpha
-    scalars[1]      // beta
+    scalars[1],     // beta
+    MatrixLayout::kColumnMajor,
+    warmups,
+    iterations
   );
+
+  if (result == cudaSuccess) {
+    result = TestCutlassGemm(
+      problem[0],
+      problem[1],
+      problem[2],
+      scalars[0],
+      scalars[1],
+      MatrixLayout::kRowMajor,
+      warmups,
+      iterations
+    );
+  }
 
   if (result == cudaSuccess) {
     std::cout << "Passed." << std::endl;

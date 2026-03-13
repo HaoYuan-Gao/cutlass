@@ -69,6 +69,7 @@ CUTE_HOST_DEVICE constexpr
 auto
 make_layout(Swizzle<B,M,S> const& sxor)
 {
+  // M + B + abs(S) 表示参与 swizzle 的最大位宽 (bits)
   return composition(sxor, Layout<Int<M+B+abs(S)>,Int<1>>{});
 }
 
@@ -90,6 +91,45 @@ transfer_swizzle(Layout<OldShape,OldStride> const& old_layout,
   // which is a new swizzle identifier for S?, the new swizzle
 
   // Projections of the swizzle layout for composition, P
+  
+  // Swizzle 的本质操作为：
+  //
+  //     ZZZ ^= YYY
+  //
+  // 其中 YYY 和 ZZZ 表示 offset 中参与 XOR 的两组 bit。 其它 bit 不影响 Swizzle，因此这里构造一个 projection layout，
+  // 只生成 YYY 和 ZZZ 两部分 bit，用于分析当前 layout 中哪些 bit 实际参与了 Swizzle。
+  //
+  // 假设 offset 的 bit 分布如下：
+  //
+  //     ... | YYY | gap | ZZZ | ...
+  //           ^           ^
+  //           |           |
+  //        Y bit 区域    Z bit 区域
+  //
+  // 该 layout 的五个 mode 分别表示：
+  //
+  //   mode-0:
+  //       低 MBase 位。
+  //       这些 bit 不参与 Swizzle。
+  //
+  //   mode-1:
+  //       ZZZ bit 区域。
+  //       stride = 1 << M
+  //       用于生成 ZZZ 对应的 bit。
+  //
+  //   mode-2:
+  //       YYY 和 ZZZ 中间的间隔 bit。
+  //       不参与 Swizzle，因此 stride 为 0。
+  //
+  //   mode-3:
+  //       YYY bit 区域。
+  //       stride = 1 << (M + abs(S))
+  //       用于生成 YYY 对应的 bit。
+  //
+  //   mode-4:
+  //       更高位 bit。
+  //       不参与 Swizzle。
+  //
   auto swizzle_only_zy = make_layout(make_shape (Int<(1 << M)>{}, Int<(1 << B)>{}, Int<(1 << (abs(S)-B))>{}, Int<(1 <<  B        )>{}, Int<1>{}),
                                      make_stride(       Int<0>{}, Int<(1 << M)>{},                 Int<0>{}, Int<(1 << (M+abs(S)))>{}, Int<0>{}));
 
@@ -102,6 +142,15 @@ transfer_swizzle(Layout<OldShape,OldStride> const& old_layout,
   auto zzz_msk = typename Swizzle<B,M,S>::zzz_msk{};
   auto yyy_msk = typename Swizzle<B,M,S>::yyy_msk{};
   auto msk_sft = typename Swizzle<B,M,S>::msk_sft{};
+
+  //
+  // swizzle_active_bits 不是某一个具体 offset 的数值，而是一个 bit mask，用来表示：
+  //
+  //     "哪些 bit 位置会被当前 layout 产生", 即 yyy / zzz 的所有可能的 bit 组合（所有可能的值）。
+  //     比如 yyy_mask = 11， 表示 yyy 在 layout 中的值是 00, 01, 10, 11 这 4 种可能。
+  //  
+  // And 操作是取出 yyy 和 zzz 都有值的区域，因为这个交集才能执行 zzz ^= yyy。
+  //
   auto active_Z = swizzle_active_bits & shiftr(swizzle_active_bits,  msk_sft) & zzz_msk;
   auto active_Y = swizzle_active_bits & shiftr(swizzle_active_bits, -msk_sft) & yyy_msk;
 
@@ -198,6 +247,42 @@ make_swizzle_strides(true_type,
   //   0  Z  DC
   //   1 -Z  DC
 
+  // 这个函数实际上是在把：Swizzle(offset + stride) - Swizzle(offset) 提前化简成：±stride
+  //
+  // Swizzle 的核心操作是 ZZZ ^= YYY，Y << I = 代表提取第 I 位（把 Y 理解成 000..1..00.. 这样的二进制值）
+  // 
+  // Case 1: Y == 0
+  //     offset 中的：
+  //          Y Z
+  //          0 0
+  //     after swizzle:
+  //          Z ^ Y = 0 ^ 0 = 0
+  //
+  //     Increase Z by one:
+  //          Y Z
+  //          0 1
+  //     after swizzle:
+  //          Z ^ Y = 1 ^ 0 = 1
+  //
+  //     The swizzled offset increases by +1:
+  //          stride = +Z
+  //
+  // Case 2: Y == 1
+  //     offset 中：
+  //          Y Z
+  //          1 0
+  //     after swizzle:
+  //          Z ^ Y = 0 ^ 1 = 1
+  //
+  //     Increase Z by one:
+  //          Y Z
+  //          1 1
+  //     after swizzle:
+  //          Z ^ Y = 1 ^ 1 = 0
+  //
+  //     The swizzled offset decreases by -1:
+  //          stride = -Z
+  //
   return cute::make_tuple(conditional_return((offset & (Y << Int<I>{})) == Int<0>{}, Z * Int<(1 << I)>{}, -Z * Int<(1 << I)>{})...);
 }
 
@@ -219,6 +304,7 @@ make_swizzle_strides(false_type,
   //   0 Y+Z Y-Z
   //   1 DC  DC
 
+  // 沿着 Y 加 1 后，swizzle 结果的 stride，原理同上，因为 Y 增加会影响 Z 的值，所以这里会有 Y+Z 或 Y-Z
   return cute::make_tuple(conditional_return((offset & (Z << Int<I>{})) == Int<0>{}, (Y+Z) * Int<(1 << I)>{}, (Y-Z) * Int<(1 << I)>{})...);
 }
 

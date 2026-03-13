@@ -1288,6 +1288,8 @@ right_inverse(Layout<Shape,Stride> const& layout)
       [[maybe_unused]] auto istride = get<i>(lstride);
       [[maybe_unused]] auto curr_stride = get<2>(init);
 
+      // 如果 x 为 linear_coord, L(RI(x)) = x
+      // 因此，如果 codomain 不连续，就跳过
       if constexpr (is_constant<decltype(istride)::value, decltype(curr_stride)>::value) {
         return make_tuple(append(get<0>(init),  ishape),                // result_shape
                           append(get<1>(init), get<i>(preprod_shape)),  // result_stride
@@ -1349,6 +1351,8 @@ left_inverse(Layout<Shape,Stride> const& layout)
 
         CUTE_STATIC_ASSERT_V((istride % size(result_shape)) == Int<0>{}, "Left inverse divisibility condition");
 
+        // LI(L(y)) = y
+        // LI 的输入是 Layout 的输出，所以不在乎输出是否连续
         return make_tuple(append(result_shape,  istride / size(result_shape)),
                           append(result_stride, get<i>(preprod_shape)));
       }
@@ -1356,6 +1360,13 @@ left_inverse(Layout<Shape,Stride> const& layout)
       CUTE_GCC_UNREACHABLE;
     });
 
+  // 假设排序后最大的 stride 是：D_max, 它对应的 shape 是：S_max
+  // ​istride / size(result_shape) 会不断构造，最终使得：size(result_shape) = D_max
+  // 然后 append(result_shape, S_max) 使得 Size(LI) = D_max * S_max
+  // 而原 Layout 的地址可以写成：L(x) = D_max * x + 低位部分，其中 0 <= 低位部分 < D_max
+  // 并且前面的 stride 分层条件保证低位部分处在：[0, D_max) 之间
+  // 因此：L(x) < D_max​ * S_max​
+  // 也就是：L(x) ∈ size(LI)
   return coalesce(make_layout(append(result_shape, get<decltype(back(sorted_seq))::value>(lshape)),
                               result_stride));
 }
@@ -1384,6 +1395,14 @@ auto
 max_common_layout(Layout<ShapeA,StrideA> const& a,
                   Layout<ShapeB,StrideB> const& b)
 {
+  // 1. right_inverse(b) 代表 b(inv_b(i)) = i
+  // 2. coalesce(composition(a, inv_b)) 代表 a(inv_b(i)) == common(inv_b(i))
+  // 3. if constexpr (is_static<decltype(shape<0>(common))>::value && is_constant<1, decltype(stride<0>(common))>::value)
+  //    代表第一个 mode 的 stride 值为 1，即 common(i)=i, 即满足 a(inv_b(i)) = i
+  // 4. 因为 inv_b(common(i)) = i, 所以第一个 mode (layout<0>) 内满足 inv_b(common(i)) = inv_b(i)，
+  //    因为 inv_b 满足 b(inv_b(i)) = i, 所以该步相当于限制定义域 i 为 layout<0>(common)
+  // 5. 最终 inv_b 满足：a(inv_b(i)) = i, b(inv_b(i)) = i
+
   Layout inv_b  = right_inverse(b);
   Layout common = coalesce(composition(a, inv_b));
 
@@ -1807,7 +1826,11 @@ template <int N, class Shape, class Stride>
 CUTE_HOST_DEVICE constexpr
 auto
 upcast(Shape const& shape, Stride const& stride)
-{
+{ 
+  // 1. 原始一步为一个元素，而 upcast 的意思是 N 步视为一个元素. 所以 stride 要除以 N.
+  // 2. 如果 N 大于 stride, 那么走完 N 步需要 N / stride 个元素，新的 shape 需要适配新的 “元素”数，
+  //    所以新的 shape 需要重新计算：ceil_div(shape, N/stride).
+
   if constexpr (is_tuple<Shape>::value) {                  // tuple stride
     return transform_layout(shape, stride, [](auto const& s, auto const& d) { return upcast<N>(s,d); });
   } else if constexpr (is_constant<0, Stride>::value) {    // static-0 stride
@@ -1843,6 +1866,8 @@ CUTE_HOST_DEVICE constexpr
 auto
 downcast(Shape const& shape, Stride const& stride)
 {
+  // downcast 和 upcast 意义相反，把一个大的 “元素” 视为 N 个小的 “元素”。
+
   if constexpr (is_tuple<Shape>::value) {
     return transform_layout(shape, stride, [](auto const& s, auto const& d) { return downcast<N>(s,d); });
   } else if constexpr (is_constant<1, Stride>::value || is_constant<-1, Stride>::value) {
@@ -1906,7 +1931,14 @@ max_alignment(Layout<Shape,Stride> const& layout)
   auto static_shape  = transform( shape(flat_layout), [](auto s){ return conditional_return<is_static<decltype(s)>::value>(s, Int<1>{}); });
   auto static_stride = transform(stride(flat_layout), [](auto d){ return conditional_return<is_static<decltype(d)>::value>(d, Int<0>{}); });
   auto filter_layout = make_layout(static_shape, static_stride);
+
+  // right_inverse 会自动获取第一块连续的内存元素，并且把这个连续的块视为一个 Tile,
+  // logical_divide 会自动获取 Tile 中剩余的内存元素，并且把这个剩余的块视为 Rest,
   auto permuted = logical_divide(filter_layout, right_inverse(filter_layout));
+
+  // (Tile, Rest) : (S_t, S_r)
+  // size<0> 获得 Tile 的大小，stride<1> 获得 Rest 的步长(也即第一个 Tile 的大小)
+  // 相当于 ---  gcd(内部连续区域大小, 外层区域stride)
   return gcd(size<0>(permuted), stride<1>(permuted));
 }
 
