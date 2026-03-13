@@ -771,6 +771,33 @@ recast(Tensor&& tensor)
     if constexpr (sizeof(OldType) < sizeof(NewType) && not is_composed_layout<decltype(old_layout)>::value) {
       auto shape_diff = transform(flatten(old_layout.shape()), flatten(new_layout.shape()), minus{});
       auto extent_diff = transform(shape_diff, flatten(old_layout.stride()), multiplies{});
+
+    // NOTE:
+    // For an upcast, one vectorized group contains
+    //   N = sizeof(NewType) / sizeof(OldType)
+    // consecutive OldType elements.
+    //
+    // The negative-stride pointer adjustment below is only correct when the
+    // stride-1 mode contains exactly one such vectorized group, i.e.
+    //   old_shape == N
+    //   new_shape == 1
+    // because then:
+    //   old_shape - new_shape == N - 1
+    // which is exactly the offset needed to move the pointer from the last
+    // OldType element of the reversed group to the first element.
+    //
+    // For example:
+    //   int8_t -> int32_t, N = 4
+    //   Layout(4 : -1) -> Layout(1 : -1)
+    //   offset = (4 - 1) * (-1) = -3   // correct
+    //
+    // But for multiple groups, e.g.
+    //   Layout(8 : -1) -> Layout(2 : -1)
+    // this formula gives:
+    //   offset = (8 - 2) * (-1) = -6
+    // while the per-group correction should still be only -(N - 1) = -3.
+    //
+    // CuTe's negative-stride support is incomplete for such cases.
       auto offset = fold(extent_diff, Int<0>{}, [](auto const& i, auto const& a) { return i + cute::min(a,Int<0>{}); });
 
       return make_tensor(recast_ptr<NewType>(static_cast<Tensor&&>(tensor).data() + offset), new_layout);

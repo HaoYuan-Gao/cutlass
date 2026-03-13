@@ -83,9 +83,13 @@ struct TensorOpMultiplicand {
 
   /// Contiguous dimension of the tile shape matches one shared memory cache
   /// line - 128B.  For 128bit access size, it equals to 8 accesses.
+
+  /// 128B shared memory line can hold 8 vector accesses (128bit each), it need 8 threads to cover all 8 accesses.
   static int const kTileShapeContiguous = 128 / (kAccessSize / 8);
 
   /// Number of kblocks to store PartitionShape::kContiguous Elements
+
+  /// Number of swizzle regions in one tile.
   static int const kFactor =
       kTileShapeContiguous * kElementsPerAccess / kCrosswise;
 
@@ -97,6 +101,9 @@ struct TensorOpMultiplicand {
   /// kTileShapeContiguous) for a warp to access.  To ensure conflict free
   /// access, it also needs to be at least (kTileShapeContiguous / kFactor).
   /// See comments below
+
+  /// kTileShapeContiguous / kFactor: Minimum stride extent required for one swizzle region.
+  /// 32 / kTileShapeContiguous: Minimum number of stride rows required for 32 warp threads to cover the whole tile.
   static int const kTileShapeStride =
       ((kTileShapeContiguous / kFactor) > (32 / kTileShapeContiguous))
           ? (kTileShapeContiguous / kFactor)

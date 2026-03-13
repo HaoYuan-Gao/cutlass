@@ -50,6 +50,7 @@ namespace cute
  *   arithmetic expressions (according to the operator-overloads for cute::C and cute::R,
  *   though these may be incomplete) but with a potential rational value rather than an integral value.
  */
+ // 表示一个有理数的分数，比如 R<3,6> 表示 1/2, 其中 num 是分子，den 是分母。
 template <auto n, auto d>
 class R {
   static_assert(d != 0);

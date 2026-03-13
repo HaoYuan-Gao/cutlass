@@ -237,6 +237,7 @@ struct PredicatedTileAccessIteratorParams {
   // Methods
   //
 
+  // 这里的 stride 是 stride 方向的长度（ldm）, 可以查看 layout (PitchLinear) 的 stride 函数定义, 不要混淆定义
   CUTLASS_HOST_DEVICE
   Status initialize(LongIndex stride, PredicatedTileAccessIteratorDesc desc) {
     CUTLASS_ASSERT(desc.element_size_bits > 0);

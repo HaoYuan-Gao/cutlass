@@ -135,6 +135,7 @@ class PredicatedTileAccessIteratorPredicates {
       /// Extent of the matrix window
       TensorCoord extent,
       /// optionally, simplify predicate calculation during 'steady state' phase
+      /// 是否为边界区域
       bool is_steady_state = false) {
 
     CUTLASS_PRAGMA_UNROLL

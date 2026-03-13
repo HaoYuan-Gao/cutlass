@@ -64,7 +64,10 @@ namespace conv {
 struct Conv2dProblemSize {
 
   // Conv2d strictly problem size parameters
-  int N, H, W, C, P, Q, K, R, S;
+  int N, H, W, C; // N: batch size, H: height, W: width, C: Cin
+  int K, R, S;    // K: Cout, R: filter height, S: filter width
+  int P, Q;       // P: height of output, Q: width of output
+
   int pad_h, pad_w;
   int stride_h, stride_w;
   int dilation_h, dilation_w;

@@ -214,6 +214,7 @@ template <class T>
 CUTE_HOST_DEVICE constexpr
 T
 rotr(T x, int s) {
+  // T 数据类型的进位位数，不包含符号位，比如 uint8_t 是 8 位, int8_t 是 7 位
   constexpr int N = numeric_limits<T>::digits;
   return static_cast<T>(s == 0 ? x : s > 0 ? (x >> s) | (x << (N - s)) : rotl(x, -s));
 }
