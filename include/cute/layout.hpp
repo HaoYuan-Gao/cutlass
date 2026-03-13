@@ -1288,6 +1288,8 @@ right_inverse(Layout<Shape,Stride> const& layout)
       [[maybe_unused]] auto istride = get<i>(lstride);
       [[maybe_unused]] auto curr_stride = get<2>(init);
 
+      // 如果 x 为 linear_coord, L(RI(x)) = x
+      // 因此，如果 codomain 不连续，就跳过
       if constexpr (is_constant<decltype(istride)::value, decltype(curr_stride)>::value) {
         return make_tuple(append(get<0>(init),  ishape),                // result_shape
                           append(get<1>(init), get<i>(preprod_shape)),  // result_stride
@@ -1349,6 +1351,8 @@ left_inverse(Layout<Shape,Stride> const& layout)
 
         CUTE_STATIC_ASSERT_V((istride % size(result_shape)) == Int<0>{}, "Left inverse divisibility condition");
 
+        // LI(L(y)) = y
+        // LI 的输入是 Layout 的输出，所以不在乎输出是否连续
         return make_tuple(append(result_shape,  istride / size(result_shape)),
                           append(result_stride, get<i>(preprod_shape)));
       }
@@ -1356,6 +1360,13 @@ left_inverse(Layout<Shape,Stride> const& layout)
       CUTE_GCC_UNREACHABLE;
     });
 
+  // 假设排序后最大的 stride 是：D_max, 它对应的 shape 是：S_max
+  // ​istride / size(result_shape) 会不断构造，最终使得：size(result_shape) = D_max
+  // 然后 append(result_shape, S_max) 使得 Size(LI) = D_max * S_max
+  // 而原 Layout 的地址可以写成：L(x) = D_max * x + 低位部分，其中 0 <= 低位部分 < D_max
+  // 并且前面的 stride 分层条件保证低位部分处在：[0, D_max) 之间
+  // 因此：L(x) < D_max​ * S_max​
+  // 也就是：L(x) ∈ size(LI)
   return coalesce(make_layout(append(result_shape, get<decltype(back(sorted_seq))::value>(lshape)),
                               result_stride));
 }
@@ -1384,6 +1395,14 @@ auto
 max_common_layout(Layout<ShapeA,StrideA> const& a,
                   Layout<ShapeB,StrideB> const& b)
 {
+  // 1. right_inverse(b) 代表 b(inv_b(i)) = i
+  // 2. coalesce(composition(a, inv_b)) 代表 a(inv_b(i)) == common(inv_b(i))
+  // 3. if constexpr (is_static<decltype(shape<0>(common))>::value && is_constant<1, decltype(stride<0>(common))>::value)
+  //    代表第一个 mode 的 stride 值为 1，即 common(i)=i, 即满足 a(inv_b(i)) = i
+  // 4. 因为 inv_b(common(i)) = i, 所以第一个 mode (layout<0>) 内满足 inv_b(common(i)) = inv_b(i)，
+  //    因为 inv_b 满足 b(inv_b(i)) = i, 所以该步相当于限制定义域 i 为 layout<0>(common)
+  // 5. 最终 inv_b 满足：a(inv_b(i)) = i, b(inv_b(i)) = i
+
   Layout inv_b  = right_inverse(b);
   Layout common = coalesce(composition(a, inv_b));
 
@@ -1473,6 +1492,13 @@ domain_distribute(ShapeA const& a, ShapeB const& b)
 //
 // Kernel (Nullspace) of a Layout
 //
+
+// nullspace(layout):
+//   找出 layout flatten 后 stride == 0 的那些维度——即坐标沿这些维度变化、offset 却不变的维度(线性映射 offset = dot(coord, stride) 的核/kernel)。
+//   把这些维度的 shape 取出来,重新赋一套紧凑(dense, LayoutLeft)stride, 构造出一个新 layout:它把这些"冗余坐标"一一映射到 0..size(nullspace)-1
+//   的唯一下标上,而不再保留原来的 0 stride。
+//
+//   用途:配合 zipped_divide,可以把一个 layout 按 "有效维度" 和 "冗余(广播)维度" 拆开,从而识别/消除因 stride=0 造成的重复写入或重复读取。
 
 /** Return a layout that represents the nullspace of @a layout
  * @post @a layout(@a result(i)) == 0 for all i < size(@a result)
@@ -1807,7 +1833,11 @@ template <int N, class Shape, class Stride>
 CUTE_HOST_DEVICE constexpr
 auto
 upcast(Shape const& shape, Stride const& stride)
-{
+{ 
+  // 1. 原始一步为一个元素，而 upcast 的意思是 N 步视为一个元素. 所以 stride 要除以 N.
+  // 2. 如果 N 大于 stride, 那么走完 N 步需要 N / stride 个元素，新的 shape 需要适配新的 “元素”数，
+  //    所以新的 shape 需要重新计算：ceil_div(shape, N/stride).
+
   if constexpr (is_tuple<Shape>::value) {                  // tuple stride
     return transform_layout(shape, stride, [](auto const& s, auto const& d) { return upcast<N>(s,d); });
   } else if constexpr (is_constant<0, Stride>::value) {    // static-0 stride
@@ -1843,6 +1873,8 @@ CUTE_HOST_DEVICE constexpr
 auto
 downcast(Shape const& shape, Stride const& stride)
 {
+  // downcast 和 upcast 意义相反，把一个大的 “元素” 视为 N 个小的 “元素”。
+
   if constexpr (is_tuple<Shape>::value) {
     return transform_layout(shape, stride, [](auto const& s, auto const& d) { return downcast<N>(s,d); });
   } else if constexpr (is_constant<1, Stride>::value || is_constant<-1, Stride>::value) {
@@ -1906,7 +1938,45 @@ max_alignment(Layout<Shape,Stride> const& layout)
   auto static_shape  = transform( shape(flat_layout), [](auto s){ return conditional_return<is_static<decltype(s)>::value>(s, Int<1>{}); });
   auto static_stride = transform(stride(flat_layout), [](auto d){ return conditional_return<is_static<decltype(d)>::value>(d, Int<0>{}); });
   auto filter_layout = make_layout(static_shape, static_stride);
+
+  /*
+   * 设 filter_layout 为 L，它将逻辑坐标映射到内存地址。为了寻找 L 所覆盖的、从地址 0 开始的最大连续区域，需要从连续地址反查其
+   * 逻辑坐标，因此使用右逆 R = right_inverse(L)：
+   *
+   *     L(R(i)) = i,  0 <= i < size(R)
+   *
+   * 不能使用 left_inverse，因为它只保证：
+   *
+   *     LI(L(x)) = x
+   *
+   * 它只能恢复 L 已经产生的地址，并不保证 L(LI(i)) = i。对于 padding 中的地址，L(LI(i)) 可能跳到另一个有效地址，因此不能用来识别连续
+   * 内存区域。
+   *
+   * logical_divide(L, R) 使用 R 将 L 重排为：
+   *
+   *     (ContiguousTile, Rest)
+   *
+   * right_inverse 将 Layout 的定义域重排为内存地址顺序。但是 logical_divide 之后，输入仍是逻辑坐标，因为第一个 mode 的
+   * 坐标值与连续内存地址偏移相同，例如 L = (_4,_3):(_1,_8)，其映射如下：
+   *      x:     0 1 2 3 | 4 5  6  7 |  8  9 10 11
+   *      L(x):  0 1 2 3 | 8 9 10 11 | 16 17 18 19
+   * 可以看到第一个 mode 的坐标值与连续内存地址偏移相同，即 permuted(i, 0) == i。
+   */
   auto permuted = logical_divide(filter_layout, right_inverse(filter_layout));
+
+  // permuted 的 shape 为： (Tile, Rest) : (S_t, S_r)
+  //
+  // size<0>(permuted)：Tile 的元素个数，即最大连续区间的长度，记为 K。
+  // stride<1>(permuted)：Rest 这一维的 stride，也就是"走完这一段连续区间后，跳到下一段起点"的步长，记为 pitch。
+  //
+  // 因为 upcast<N> 要成立需要同时满足：
+  //    1. N 能整除 K（把连续的 K 个元素均匀地分成若干组 N 个）；
+  //    2. N 能整除 pitch（分组之后，跳到下一组的步长仍然是整数）。因为 pitch 代表的下一段数据的访问地址，
+  //       如果不能整除 N，下一段数据的访问地址就是不对齐的，在硬件上通常是不允许的。
+  //
+  // 同时满足这两个整除条件的最大 N，正好就是最大公约数 gcd(K, pitch)。
+
+  // 这个函数表示： Layout 最多可以把多少个连续元素看成一个 vectorized memory access 单元
   return gcd(size<0>(permuted), stride<1>(permuted));
 }
 

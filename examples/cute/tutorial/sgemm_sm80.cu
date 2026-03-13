@@ -413,10 +413,15 @@ gemm_tn(int m, int n, int k,
     decltype(alpha), decltype(beta)>;
 
   // Set L1 to be SMEM only
+
+  // 现代 GPU (Volta 及以后)的每个 SM 上,L1 cache 和共享内存(shared memory)共用同一块物理存储(通常是 192KB / 228KB 等),
+  // 需要动态决定这块空间里多少划给 L1、多少划给 SMEM。
   cudaFuncSetAttribute(
     kernel_fptr,
     cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
+  // 设置"L1/SMEM 划分"的偏好比例,取值是 0~100 的百分数,表示倾向于把多大比例的可配置空间划给共享内存。
+  // 这里传 100 意味着"尽量把这块空间全部给 SMEM,不留给 L1"
   cudaFuncSetAttribute(
     kernel_fptr,
     cudaFuncAttributePreferredSharedMemoryCarveout, 100);

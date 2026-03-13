@@ -582,6 +582,9 @@ void gemm_host_f16xf16_f32_f32_tnt(TypeA const* device_ptr_A, LayoutA layout_A,
   // SMEM layouts for C and D should match the epilogue tile
   auto sC_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeC>{}, // MMA K-major is equivalent to epilogue N-major
                                     make_shape(size<0>(epi_tiler), size<1>(epi_tiler)));
+
+  // 如果不 group, tma_partition 会把 mode 0 仅看成 M, 把 N 误认为外层的 Rest mode,
+  // 无法和 gD_epi 的 (EpiTile, NumTiles) 正确对应
   auto sC_layout = group<0,2>(sC_layout_mn); // Group modes for tma_partition
 
   auto sD_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeD>{}, // MMA K-major is equivalent to epilogue N-major

@@ -118,6 +118,46 @@ using namespace cute;
 // TypeD = float;            // MMA D Data Type
 // TypeAccumulator = float;  // Both TypeC and TypeD are float, so we use float accumulator type
 
+
+//
+// Tutorial 03 与 Tutorial 04 核心区别
+//
+// | 对比项            | Tutorial 03                    | Tutorial 04                         |
+// |-------------------|--------------------------------|-------------------------------------|
+// | 执行模式           | 1SM UMMA                       | 2SM 协作 UMMA                       |
+// | MMA 类型           | SM100_MMA_F16BF16_SS           | SM100_MMA_F16BF16_2x1SM_SS         |
+// | PTX CTA group     | cta_group::1                   | cta_group::2                        |
+// | 协作 CTA 数        | 1 个 CTA                       | 2 个 peer CTA                       |
+// | MMA Shape         | 128x256x16                     | 256x256x16                          |
+// | ThrID             | Layout<_1>                     | Layout<_2>                          |
+// | ThrLayoutVMNK     | (1,1,1,1)                      | (2,1,1,1)                           |
+// | V 维含义           | 固定为 0                       | peer CTA 编号 0/1                   |
+// | C fragment        | tmem_frg_1sm                   | tmem_frg_2sm                        |
+// | N_SM              | 1                              | 2                                   |
+// | TMEM allocator    | Allocator1Sm                   | Allocator2Sm                        |
+// | TMA 类型          | SM90_TMA_LOAD_MULTICAST        | SM100_TMA_2SM_LOAD_MULTICAST        |
+// | TMA 发起          | 每个 CTA 独立发起                | leader 和 peer CTA 都发起           |
+// | MMA 发起          | 每个 CTA 发起自己的 MMA          | 仅 leader CTA 发起                  |
+// | MMA 完成通知      | umma_arrive_multicast          | umma_arrive_multicast_2x1SM         |
+// | CTA 本地 C        | 128x256                        | 128x256                             |
+// | 完整 MMA 的 C     | 128x256                        | 两个 SM 合计 256x256                |
+//
+// N_SM 表示一条 UMMA 指令协作使用的 SM 数量：
+//   N_SM = 1：一个 CTA/SM 独立执行。
+//   N_SM = 2：两个 peer CTA/SM 协作执行。
+//
+// 2SM MMA 的 C/TMEM 分布：
+//
+//                         N = 256
+//                 +--------------------+
+//   M = 0         | peer 0 本地 TMEM   |
+//                 | C[0:128, 0:256]    |
+//   M = 128       +--------------------+
+//                 | peer 1 本地 TMEM   |
+//                 | C[128:256, 0:256]  |
+//   M = 256       +--------------------+
+//
+
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 // The shared memory buffers for A and B matrices.
@@ -277,6 +317,9 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
 
   // Construct the CTA-in-Cluster coordinate for multicasting
   auto cta_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(int(cute::block_rank_in_cluster()));
+
+  // cluster_layout_vmnk 的 v 代表 tcgen05.mma 使用了几个 CTA(SM) 来进行计算
+  // 在该测试用例中，tcgen05.mma 使用了 2 个 CTA(SM) 来进行计算，同时使用 0 号 CTA(SM) 作为 leader CTA
   auto elect_one_cta  = get<0>(cta_in_cluster_coord_vmnk) == Int<0>{};
 
   // Project the cluster_layout for tma_A along the N-modes
@@ -300,6 +343,7 @@ gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)
                               create_tma_multicast_mask<0,2>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
 
   // Calculate total bytes that TMA will transfer each tile to track completion, accounting for TMA.2SM
+  // 统计 2 个 CTA(SM) 共同负责传输的字节数
   int tma_transaction_bytes = size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tAsA))
                             + size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tBsB));
 

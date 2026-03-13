@@ -152,6 +152,11 @@ bit_width(T x) {
                     (numeric_limits<T>::digits ==  8 ? 3 : (assert(false),0)))));
   T r = 0;
   for (int i = N - 1; i >= 0; --i) {
+    // 二分法查找最小的位数表示 x 的值：
+    // 判断是否大于 2^i-1，如果大于，说明 x 的第 i 位是 1，将 r 的第 i 位置为 1
+    // 然后将 x 右移 i 位，继续判断第 i-1 位是否为 1
+    // 直到 x 为 0，说明所有位都被判断完毕
+    // 最后返回 r + (x != 0)，如果 x 不为 0，说明至少需要 N 位表示 x，否则只需要 N-1 位
     T shift = (x > ((T(1) << (T(1) << i))-1)) << i;
     x >>= shift;
     r  |= shift;
@@ -214,6 +219,7 @@ template <class T>
 CUTE_HOST_DEVICE constexpr
 T
 rotr(T x, int s) {
+  // T 数据类型的进位位数，不包含符号位，比如 uint8_t 是 8 位, int8_t 是 7 位
   constexpr int N = numeric_limits<T>::digits;
   return static_cast<T>(s == 0 ? x : s > 0 ? (x >> s) | (x << (N - s)) : rotl(x, -s));
 }

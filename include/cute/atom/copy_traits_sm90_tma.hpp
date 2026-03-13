@@ -725,6 +725,8 @@ coalesce_256(Layout<Shape,Stride> const& layout)
   return coalesce_256_impl<1>(flat_shape, flat_stride, get<0>(flat_shape), get<0>(flat_stride));
 }
 
+// construct_tma_gbasis() 是在寻找一种 TensorMap 坐标系，使得 “SMEM 的物理连续布局” 和 “GMEM 的物理连续布局” 尽可能匹配，
+// 同时把 CuTe 任意 hierarchical layout 压缩成 TMA 硬件最多 5D、每个 box mode ≤256 的表示。
 template <class TmaInternalType,
           class GEngine, class GLayout,
           class SShape, class SStride,
@@ -884,10 +886,20 @@ fill_tma_gmem_shape_stride(Tensor<GEngine,GLayout>   const& gtensor,           /
         // Problem stride (in bytes)
         uint64_t stride_j = basis_get(ej, gmem_stride);
         uint64_t old_stride = gmem_prob_stride[i];
+        // 多个 mode 提取最大公约数，用于 stride 合并：
+        //    1. 假设旧的 offset = 6x + 10y， 其中 6, 10 为 stride 的值
+        //    2. 合并后的 offset = 2 * (3x + 5y)，2 为最大公约数
         gmem_prob_stride[i] = gcd(gmem_prob_stride[i], stride_j);
 
         if (gmem_prob_stride[i] != 0) {
           // Recurrence: g_shape = (s_i - 1) * (d_i / gcd_j d_j) + 1
+
+          // 为了适配 stride 的合并规则，所以要做出如下调整：
+          //   1. 兼容存在 padding 的情况，计算每一个 mode 的最大偏移量，并求和
+          //   2. 找一个递归变量，用于计算每个 mode 的偏移量
+          //   3. S_new = (S_old - 1) * (D_old / D_new) + (S_j - 1) * (D_j / D_new) + 1
+          // 其中 S_new 表示当前 mode 的 shape，其意义也不是表示有 S_new 个有些元素，而是表示当前 mode 的最大偏移量，
+          // 中间的某些元素可能是无效的 hole
           gmem_prob_shape[i] = (gmem_prob_shape[i]-1) * (old_stride / gmem_prob_stride[i])
                              +            (shape_j-1) * (stride_j   / gmem_prob_stride[i])
                              + 1;
@@ -951,6 +963,7 @@ make_tma_copy_desc(Tensor<GEngine,GLayout> const& gtensor,         // The origin
 
   fill_tma_gmem_shape_stride(gtensor_T, stride(tma_gbasis), gmem_prob_shape, gmem_prob_stride);
 
+  // 相关 assert 都是 API 要求，具体参靠: 
   assert((reinterpret_cast<uint64_t>(gmem_address) & 0b1111) == 0);  // Address must be 16B-aligned
 
   assert(gmem_prob_shape[0] >= (uint64_t(1)));               // Size must be min 1
@@ -1100,6 +1113,18 @@ make_tma_copy_desc(Tensor<GEngine,GLayout> const& gtensor,         // The origin
     } else {
       auto tma_gmem_basis_stride = stride(tma_gbasis);
       // Find j such that E<i> is in stride<j>(tma_gbasis)
+      
+      // j == 0
+      // → TMA 最内层隐式 stride=1
+      // → 按实际 GMEM offset / TmaInternalType 大小计算 scale
+
+      // j > 0 && 只有一个 GMEM mode
+      // → 一对一
+      // → scale = 1
+
+      // j > 0 && 多个 GMEM modes 被 group
+      // → scale_i = original_stride_i / TMA_stride_j
+      // → 多个 GMEM modes 被 group 时，求 offset = t * D_new, 以 offset = 2 * (3x + 5y) 为例，t = 3x + 5y
       using EI = decltype(ei);
       [[maybe_unused]] auto j = find_if(tma_gmem_basis_stride, [&](auto tma_stride_j) { return any_of(tma_stride_j, [&](auto dj) { return dj == EI{}; }); });
       if constexpr (decltype(j == rank(tma_gmem_basis_stride))::value) {
@@ -1457,6 +1482,12 @@ create_tma_multicast_mask(CtaLayout const& cta_layout_vmnk,
 {
   auto [cta_layout, elected_cta] = slice_and_offset(cta_coord_vmnk, cta_layout_vmnk);
 
+  // 为什么 mask 是 16 bit 的类型呢？
+  //    因为 Cluster 的最多只有 8 个，Blackwell B200 允许 non-portable cluster 最多 16 个 CTA，
+  //    使用 16-CTA cluster 必须设置 cudaFuncAttributeNonPortableClusterSizeAllowed
+  //
+  // 参考 https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html#thread-block-clusters
+  
   uint16_t mcast_mask = 0;
   if constexpr (rank_v<decltype(cta_layout)> == 0) {
     // Trivial case with no additional ctas

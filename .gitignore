@@ -2,3 +2,8 @@
 __pycache__/
 cutlass_library.egg-info/
 /build*
+.cache
+.clangd
+.vscode
+.history
+compile_commands.json

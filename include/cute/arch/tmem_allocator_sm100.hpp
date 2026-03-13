@@ -43,6 +43,22 @@ namespace cute::TMEM {
 //
 
 // 128 DP x 512 COL x uint32_t-addressing
+// 
+// 参考：https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory
+//
+//  在 SM100 上，可以把每个 CTA(SM) 的 TMEM 看成：
+//                          COL
+//                     0   1   2   ... 511
+//                  +-----------------------+
+//        DP   0    |32b|32b|32b| ... |32b |
+//        DP   1    |32b|32b|32b| ... |32b |
+//        ...       |                       |
+//        DP 127    |32b|32b|32b| ... |32b |
+//           +-----------------------+
+//  DP 是 Data Path lane，可以理解为 Tensor Core 内部的一条数据通路，也就是 TMEM 的 “行”。
+//  
+//  TMEM 分配也是按 COL 进行的，分配粒度最小为 32 列，并且列数必须是 2 的幂。当申请一列时，128 个 DP 会同时分配。
+//
 using MAX_CAPACITY_BITS = Int<128*512*32>;
 
 // TMEM DP stride in bit-addressing (shift by 5 for conversion from uint32_t)

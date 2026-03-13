@@ -103,6 +103,16 @@ struct CollectiveMma<
 
   // Statically asserting to ensure only 1x1x1 cluster shape & 1sm setup is received
   static_assert(size(AtomThrShapeMNK{}) == 1, "Lower alignment SM100 GEMM only supports 1SM MMA");
+  // MOE 模式中，因为输入矩阵 shape 不固定，但是 TMA 会使用一个 CuTensorMap 来描述内存，因此该 descriptor 会
+  // 频繁更新，甚至成为瓶颈，所以用 TMA 加载 shape 固定的 weight，用 cp.async 加载 shape 变化的 input
+  //
+  // TMA 是 hopper 架构后的硬件单元，一个线程发起一次调用后，剩下的多维张量地址计算、边界 padding、
+  // 跨 cluster 的 multicast 广播，全部由这个独立单元自主完成
+  //
+  // cp.async 本质上还是 "每个线程各自发一条 load-store 类指令"，只是这条指令有个特殊能力——数据从 
+  // L2/global 直接搬进 shared memory，全程不经过寄存器文件（register file），16B 粒度时还能额外
+  // 绕过 L1 cache（避免污染）。它复用的还是 SM 已有的内存流水线，只是多了"跳过寄存器"这一硬件旁路，
+  // 不是一个独立于常规 load/store 之外的新模块。
   static_assert(size(ClusterShape{}) == 1, "CPASYNC does not support multicast so the cluster shape is restricted to 1, 1, 1");
 
   static_assert(size(typename TiledMma::AtomThrID{}) == 1);

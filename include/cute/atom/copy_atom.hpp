@@ -500,6 +500,9 @@ make_tiled_copy(Copy_Atom<Args...> const& copy_atom,
   // (M,N) -> (thr_idx, val_idx)
   auto layout_mn = raked_product(thr_layout, val_layout);
   // (thr_idx, val_idx) -> (M,N)
+
+  // 定义 ownership 时，是从 Tile 坐标得到 TV；真正执行时，我们手里拿的是 (thread_idx, val_idx)，
+  // 因此需要由 TV 反查 Tile 坐标。这个反查要求 layout_mn(layout_tv(tv)) == tv，所以语义上就是 right inverse。
   auto layout_tv = right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
   // Tiler for extracting relevant elements
   // (M,N) -> tensor coord

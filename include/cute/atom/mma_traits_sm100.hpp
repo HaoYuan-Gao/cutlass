@@ -456,6 +456,7 @@ enum class TmemAllocMode {
 
 struct tmem_frg_base {};
 
+// N_SM: N 个 SM 协作完成一个 UMMA 指令
 // The UMMA Traits below have custom fragment type flags for their tmem tensors.
 // These flags specialize a MakeTensor customization point to correctly make the fragment that is desired.
 template <class ValueType, class StorageType, int N_SM, UMMA::TmemAllocMode TmemAlloc = UMMA::TmemAllocMode::Interleaved>
@@ -487,9 +488,17 @@ struct tmem_frg : tmem_frg_base
     constexpr int M_MMA = decltype(size<0,0>(tmem_shape))::value;
     constexpr int N_MMA = decltype(size<0,1>(tmem_shape))::value;
 
+    //  TMEM 地址编码, 参考 /home/gaohaoyuan/cutlass/include/cute/pointer.hpp 的 tmem_ptr<T>
+    //      31            24 23          16 15                                0
+    //      +---------------+---------------+---------------------------------+
+    //      | Hijack idx    | DP/lane index |          column index           |
+    //      +---------------|---------------+---------------------------------+
+    //
     // It's convenient to use "virtual tensor memory addressing"
     //   with DP_STRIDE=1, COL_STRIDE=128 to define the tmem_atom,
     //   then convert to "logical tensor memory addressing" on return.
+    //
+    // 16384 作为保留，不代表真的有 16384 列
     using COL_ADDR = C<sizeof_bits<StorageType>::value / sizeof_bits<ValueType>::value>;
     Layout tmem_restride = Layout<Shape <               _128,   _16384>,
                                   Stride<TMEM::DP<ValueType>, COL_ADDR>>{};
@@ -2045,6 +2054,7 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS<a_type, b_type, c_type,
   constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
 
   using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  // 2SM 协作 UMMA 
   using ThrID   = Layout<_2>;
   using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
                          Stride<Int<M/2>,Stride<      _1,Int<M>>>>;

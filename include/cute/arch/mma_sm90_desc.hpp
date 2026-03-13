@@ -77,6 +77,29 @@ CUTE_HOST std::ostream& operator<<(std::ostream& os, LayoutType const& t) {
 
 } // end namespace SM90::GMMA
 
+// TMA 在 global memory 和 shared memory 之间拷贝数据时，使用 64-bit shared-memory matrix descriptor 表示 shared memory 的 addr
+// 其中的 addr = base + k_core * leading + mn_core * stride + inner_offset，每一部分的规则参考:
+//        https://docs.nvidia.com/cuda/pdf/ptx_isa_8.5.pdf#page=470&zoom=100,96,557
+//
+// Tensor Core 可以直接访问 shared memory，在还原线性 index 时，需要根据 swizzle 后的地址进行转换
+// 
+// 这个 union 在定义 swizzle<B, M, S> 时，没有显示声明 S, 从代码中看 S 默认等于 3 或者 2，这个值很可能是 TMA 硬件设定死的规则，猜测：
+//    1. Shared Memory 共有 32 个 bank，每个 bank 只能访问 32-bit 数据(4 Byte)，共能访问连续的 128 Byte
+//    2. 如果 MBase 是 16 Byte， 128 / 16 = 8 个 group, 刚好可以用 3 位表示
+//    3. 同理，如果 MBase 是 32 Byte， 128 / 32 = 4 个 group, 刚好可以用 2 位表示
+// 所以在 MBase 确定的情况下，S 的值是可以确认的，即 S = 128 / MBase
+// 
+// Swizzle<B,M,S>
+//    M
+//    │
+//    └── 一个最小 atom 多大
+//    B
+//    │
+//    └── 一次重新排列多少个 atom
+//    S
+//    │
+//    └── 128 / MBase，用来表示参与 XOR atom 的 group
+// 
 union GmmaDescriptor
 {
   CUTE_HOST_DEVICE constexpr

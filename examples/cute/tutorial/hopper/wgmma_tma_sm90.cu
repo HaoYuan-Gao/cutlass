@@ -158,6 +158,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
     if ((warp_idx == 0) && lane_predicate) {
       ProducerBarType::init(&producer_mbar[pipe],   1);
+      // wgmma 指令需要 128 个线程发起
       ConsumerBarType::init(&consumer_mbar[pipe], 128);
     }
   }
@@ -168,6 +169,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   CUTE_UNROLL
   for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
   {
+    // 因为 TMA 拷贝指令本身只需要一个线程发出即可触发异步拷贝引擎，其余 127 个线程根本不需要参与这条指令。
     if ((warp_idx == 0) && lane_predicate)
     {
       // Set expected Tx Bytes after each reset / init
@@ -199,6 +201,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   clear(tCrC);
 
   // Allocate "fragments"
+  //     因为 Hopper 架构的 MMA_ATOM 中定义了 FrgTypeA, 所以 make_tensor 的时候，只创建一个 SMEM 的 view，
+  //     Tensor Core 直接从 SMEM 中读取数据，不需要额外的寄存器文件。
   Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
   Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
 
